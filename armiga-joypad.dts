@@ -1,0 +1,95 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Ejemplo de Device Tree Overlay para Armiga Joypad
+ * Compatible con:
+ *   - "armiga,joypad" (SARADC multicanal nativo)
+ *   - "armiga,singleadc-joypad" (SARADC único con multiplexor analógico CD4051/CD4052)
+ */
+
+/ {
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+			joypad: armiga-joypad {
+				compatible = "armiga,singleadc-joypad";
+				joypad-name = "Armiga Handheld Gamepad";
+				status = "okay";
+
+				/* Configuración analógica */
+				amux-count = <4>;
+				io-channels = <&saradc 0>;
+				io-channel-names = "amux_adc";
+
+				/* Pines de control del multiplexor analógico (CD4051/4052) */
+				amux-a-gpios = <&pio 1 0 0>; /* GPIOB0 */
+				amux-b-gpios = <&pio 1 1 0>; /* GPIOB1 */
+				amux-en-gpios = <&pio 1 2 0>; /* GPIOB2 */
+
+				/* Zona muerta, calibración y filtrado */
+				button-adc-scale = <1>;
+				button-adc-deadzone = <120>;
+				button-adc-fuzz = <16>;
+				button-adc-flat = <16>;
+				poll-interval = <16>; /* 16ms (~60Hz) */
+				armiga,filter-alpha = <180>; /* Filtro EMA anti-ruido (base 256) */
+
+				/* Inversión y ajuste fino por eje */
+				invert-absy;
+				invert-absry;
+				abs_x-p-tuning = <180>;
+				abs_x-n-tuning = <180>;
+
+				/* Soporte de vibración Rumble (PWM) */
+				pwms = <&pwm 0 1000000 0>;
+				pwm-names = "enable";
+				rumble-boost-strong = <5000>;
+				rumble-boost-weak = <3000>;
+
+				/* 
+				 * Botones digitales: Disposición física NINTENDO (SNES / Switch / Game Boy)
+				 * - B: Abajo      (BTN_SOUTH / 304)
+				 * - A: Derecha    (BTN_EAST  / 305)
+				 * - Y: Izquierda  (BTN_WEST  / 308)
+				 * - X: Arriba     (BTN_NORTH / 307)
+				 */
+				btn_b: button-b {
+					label = "btn-b";
+					gpios = <&pio 2 10 1>; /* Active Low - Abajo */
+					linux,code = <304>;   /* BTN_SOUTH (B en Nintendo) */
+				};
+
+				btn_a: button-a {
+					label = "btn-a";
+					gpios = <&pio 2 11 1>; /* Active Low - Derecha */
+					linux,code = <305>;   /* BTN_EAST (A en Nintendo) */
+				};
+
+				btn_y: button-y {
+					label = "btn-y";
+					gpios = <&pio 2 12 1>; /* Active Low - Izquierda */
+					linux,code = <308>;   /* BTN_WEST (Y en Nintendo) */
+				};
+
+				btn_x: button-x {
+					label = "btn-x";
+					gpios = <&pio 2 13 1>; /* Active Low - Arriba */
+					linux,code = <307>;   /* BTN_NORTH (X en Nintendo) */
+				};
+
+				btn_start: button-start {
+					label = "btn-start";
+					gpios = <&pio 2 14 1>;
+					linux,code = <315>;   /* BTN_START */
+				};
+
+				btn_select: button-select {
+					label = "btn-select";
+					gpios = <&pio 2 15 1>;
+					linux,code = <314>;   /* BTN_SELECT */
+				};
+			};
+		};
+	};
+};
