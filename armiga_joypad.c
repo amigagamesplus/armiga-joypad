@@ -130,34 +130,22 @@ static int armiga_amux_select(struct armiga_joypad *joypad, int channel)
 {
 	struct armiga_amux *amux = &joypad->amux;
 
+	/* Misma polaridad que el driver original: EN=0 habilita el mux */
 	if (amux->en)
-		gpiod_set_value_cansleep(amux->en, 1);
+		gpiod_set_value_cansleep(amux->en, 0);
 
-	switch (channel) {
-	case 0:
-		gpiod_set_value_cansleep(amux->sel_a, 1);
-		gpiod_set_value_cansleep(amux->sel_b, 1);
-		break;
-	case 1:
-		gpiod_set_value_cansleep(amux->sel_a, 1);
-		gpiod_set_value_cansleep(amux->sel_b, 0);
-		break;
-	case 2:
-		gpiod_set_value_cansleep(amux->sel_a, 0);
-		gpiod_set_value_cansleep(amux->sel_b, 1);
-		break;
-	case 3:
-		gpiod_set_value_cansleep(amux->sel_a, 0);
-		gpiod_set_value_cansleep(amux->sel_b, 0);
-		break;
-	default:
+	if (channel < 0 || channel >= ARMIGA_AMUX_CH_NUM) {
 		if (amux->en)
-			gpiod_set_value_cansleep(amux->en, 0);
+			gpiod_set_value_cansleep(amux->en, 1);
 		return -EINVAL;
 	}
 
-	/* Tiempo de estabilización para el integrado 4051/4052 */
-	usleep_range(12, 25);
+	/* canal 0: A=0 B=0, 1: A=0 B=1, 2: A=1 B=0, 3: A=1 B=1 */
+	gpiod_set_value_cansleep(amux->sel_a, (channel >> 1) & 1);
+	gpiod_set_value_cansleep(amux->sel_b, channel & 1);
+
+	/* Conmutacion del mux: 35 ns (on) / 9 ns (off) */
+	usleep_range(10, 20);
 	return 0;
 }
 
@@ -613,6 +601,8 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct armiga_joypad *joypad;
 	u32 scale = 1;
+	u32 amux_count = 0;
+	u32 amux_map[ARMIGA_AMUX_CH_NUM] = { 0, 1, 2, 3 };
 	int err;
 
 	joypad = devm_kzalloc(dev, sizeof(*joypad), GFP_KERNEL);
@@ -636,7 +626,8 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 	device_property_read_u32(dev, "armiga,filter-alpha", &joypad->ema_alpha);
 
 	/* Determinar arquitectura analógica: AMUX vs Canales IIO directos */
-	joypad->use_amux = device_property_present(dev, "amux-count");
+	device_property_read_u32(dev, "amux-count", &amux_count);
+	joypad->use_amux = amux_count > 0;
 	if (joypad->use_amux) {
 		struct armiga_amux *amux = &joypad->amux;
 
@@ -656,15 +647,29 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 		if (IS_ERR(amux->en))
 			return dev_err_probe(dev, PTR_ERR(amux->en), "Fallo al pedir gpio amux-en\n");
 
-		joypad->num_axes = 4;
-		joypad->axes = devm_kcalloc(dev, joypad->num_axes, sizeof(struct armiga_axis), GFP_KERNEL);
-		if (!joypad->axes)
-			return -ENOMEM;
+		{
+			static const struct {
+				const char *name;
+				int code;
+			} amux_axes[ARMIGA_AMUX_CH_NUM] = {
+				{ "ry", ABS_RY }, { "rx", ABS_RX }, { "y", ABS_Y }, { "x", ABS_X },
+			};
+			int i;
 
-		armiga_setup_axis(dev, &joypad->axes[0], "ry", ABS_RY, 0, scale);
-		armiga_setup_axis(dev, &joypad->axes[1], "rx", ABS_RX, 1, scale);
-		armiga_setup_axis(dev, &joypad->axes[2], "y",  ABS_Y,  2, scale);
-		armiga_setup_axis(dev, &joypad->axes[3], "x",  ABS_X,  3, scale);
+			/* Canal del mux de cada eje (orden RY, RX, Y, X); por defecto 0 1 2 3 */
+			device_property_read_u32_array(dev, "amux-channel-mapping", amux_map,
+						       ARMIGA_AMUX_CH_NUM);
+
+			joypad->num_axes = min_t(u32, amux_count, ARMIGA_AMUX_CH_NUM);
+			joypad->axes = devm_kcalloc(dev, joypad->num_axes,
+						    sizeof(struct armiga_axis), GFP_KERNEL);
+			if (!joypad->axes)
+				return -ENOMEM;
+
+			for (i = 0; i < joypad->num_axes; i++)
+				armiga_setup_axis(dev, &joypad->axes[i], amux_axes[i].name,
+						  amux_axes[i].code, amux_map[i], scale);
+		}
 	} else {
 		/* SARADC multicanal nativo */
 		int ch_count = of_property_count_strings(dev->of_node, "io-channel-names");
@@ -733,6 +738,7 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 static const struct of_device_id armiga_joypad_of_match[] = {
 	{ .compatible = "armiga,joypad", },
 	{ .compatible = "armiga,singleadc-joypad", },
+	{ .compatible = "rocknix-singleadc-joypad", },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, armiga_joypad_of_match);
