@@ -1,40 +1,39 @@
 # Armiga Joypad Linux Driver
 
-Driver moderno, unificado y de alto rendimiento para gamepads embebidos y consolas portátiles, compatible con kernels modernos de Linux (**6.6+ LTS, 6.12+ LTS y ramas 7.x**).
+Modern, unified, high-performance driver for embedded gamepads and handheld consoles, compatible with modern Linux kernels (**6.6+ LTS, 6.12+ LTS, and 7.x branches**).
 
-## Características principales
+## Key Features
 
-1. **Arquitectura Analógica Unificada:**
-   - Soporte tanto para SoCs con múltiples canales SARADC nativos (`armiga,joypad`) como para configuraciones con un solo SARADC y multiplexor analógico CD4051/CD4052 (`armiga,singleadc-joypad`).
-2. **Cero operaciones en punto flotante (`float`):**
-   - Todos los cálculos matemáticos (vector radial, escalado, filtros y zonas muertas) se procesan estrictamente con aritmética entera en punto fijo para evitar violaciones de arquitectura en ARM/ARM64.
-3. **Zona Muerta Radial Escalada:**
-   - Cálculo por vector de magnitud euclidiana (`int_sqrt`), garantizando movimiento circular suave y alcance completo de las diagonales en 360°.
-4. **Filtro Anti-ruido EMA (Exponential Moving Average):**
-   - Atenuación de ruido eléctrico y fluctuaciones del SARADC sin añadir latencia perceptible.
-5. **Botones por Interrupciones Hardware (IRQ):**
-   - Manejo de botones mediante `devm_request_threaded_irq()` para respuesta instantánea (cero latencia de entrada) y ahorro drástico de batería. Incluye fallback automático a sondeo si el banco GPIO del SoC no soporta interrupciones.
-6. **Manejo Seguro de Recursos (RAII):**
-   - Utiliza las directivas modernas `guard(mutex)(&joypad->lock)` y `device_for_each_child_node_scoped()` introducidas en Linux 6.6 y 6.11+.
-7. **Soporte de Vibración (PWM Force Feedback):**
-   - Integrado con la API moderna `pwm_apply_might_sleep()` y `input_ff_create_memless()`.
+1. **Unified Analog Architecture:**
+   - Support for both SoCs with multiple native SARADC channels (`armiga,joypad`) and configurations with a single SARADC and CD4051/CD4052 analog multiplexer (`armiga,singleadc-joypad`).
+2. **Zero Floating-Point Operations (`float`):**
+   - All mathematical calculations (radial vector, scaling, filters, and dead zones) are processed strictly using fixed-point integer arithmetic to prevent architecture faults on ARM/ARM64.
+3. **Scaled Radial Dead Zone:**
+   - Calculation via Euclidean magnitude vector (`int_sqrt`), guaranteeing smooth circular movement and full 360° diagonal range.
+4. **EMA Anti-Noise Filter (Exponential Moving Average):**
+   - Attenuation of electrical noise and SARADC fluctuations without adding perceptible latency.
+5. **Hardware Interrupt Buttons (IRQ):**
+   - Button handling via `devm_request_threaded_irq()` for instantaneous response (zero input latency) and dramatic battery saving. Includes automatic fallback to polling if the SoC GPIO bank does not support interrupts.
+6. **Modern Resource Management (RAII):**
+   - Utilizes modern directives `guard(mutex)(&joypad->lock)` and `device_for_each_child_node_scoped()` introduced in Linux 6.6 and 6.11+.
+7. **Vibration Support (PWM Force Feedback):**
+   - Integrated with the modern `pwm_apply_might_sleep()` and `input_ff_create_memless()` APIs.
 
-## Estructura del proyecto
+## Project Structure
 
-- `armiga_joypad.h`: Definiciones de constantes, estructuras y macros.
-- `armiga_joypad.c`: Código fuente del controlador.
-- `armiga-joypad.dts`: Ejemplo de Device Tree Overlay.
-- `Makefile`: Script de compilación Kbuild y soporte out-of-tree / DKMS.
+- `armiga_joypad.h`: Constant definitions, structures, and macros.
+- `armiga_joypad.c`: Driver source code.
+- `armiga-joypad.dts`: Device Tree Overlay example.
+- `Makefile`: Kbuild compilation script and out-of-tree / DKMS support.
 
-## Compilación e instalación
+## Compilation and Installation
 
 ```bash
-# Compilar contra el kernel actualmente en ejecución:
+# Compile against the currently running kernel:
 make
 
-# O compilar de forma cruzada para otra arquitectura (ej. ARM64):
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KDIR=/ruta/al/kernel/build
+# Or cross-compile for another architecture (e.g., ARM64):
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KDIR=/path/to/kernel/build
 
-# Instalar el módulo:
+# Install the module:
 sudo make install
-```
