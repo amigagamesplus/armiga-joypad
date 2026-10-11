@@ -70,6 +70,7 @@ struct armiga_button {
 	int report_type;
 	bool old_value;
 	bool use_irq;
+	u32 dpad_hat; /* 0 = boton normal, 1 = ARRIBA, 2 = ABAJO, 3 = IZQUIERDA, 4 = DERECHA */
 };
 
 struct armiga_amux {
@@ -98,6 +99,7 @@ struct armiga_joypad {
 	int num_buttons;
 	struct armiga_button *buttons;
 	bool any_button_polling;
+	bool has_hat;
 
 	/* Parámetros de filtrado y zona muerta */
 	int poll_interval_ms;
@@ -271,11 +273,12 @@ static void armiga_joypad_check_buttons_poll(struct armiga_joypad *joypad)
 {
 	int i;
 	bool sync_needed = false;
+	int hat_x = 0, hat_y = 0;
 
 	for (i = 0; i < joypad->num_buttons; i++) {
 		struct armiga_button *btn = &joypad->buttons[i];
 
-		if (!btn->use_irq) {
+		if (!btn->use_irq && !btn->dpad_hat) {
 			int val = gpiod_get_value_cansleep(btn->desc);
 			if (val >= 0 && val != btn->old_value) {
 				input_event(joypad->input, btn->report_type, btn->linux_code, val);
@@ -283,6 +286,24 @@ static void armiga_joypad_check_buttons_poll(struct armiga_joypad *joypad)
 				sync_needed = true;
 			}
 		}
+	}
+
+	if (joypad->has_hat) {
+		for (i = 0; i < joypad->num_buttons; i++) {
+			struct armiga_button *hbtn = &joypad->buttons[i];
+
+			if (!hbtn->dpad_hat || gpiod_get_value_cansleep(hbtn->desc) <= 0)
+				continue;
+			switch (hbtn->dpad_hat) {
+			case 1: hat_y = -1; break;
+			case 2: hat_y = 1; break;
+			case 3: hat_x = -1; break;
+			case 4: hat_x = 1; break;
+			}
+		}
+		input_report_abs(joypad->input, ABS_HAT0X, hat_x);
+		input_report_abs(joypad->input, ABS_HAT0Y, hat_y);
+		sync_needed = true;
 	}
 
 	if (sync_needed)
@@ -395,7 +416,8 @@ static int armiga_joypad_open(struct input_dev *input)
 		int val = gpiod_get_value_cansleep(btn->desc);
 		if (val >= 0) {
 			btn->old_value = val;
-			input_event(input, btn->report_type, btn->linux_code, val);
+			if (!btn->dpad_hat)
+					input_event(input, btn->report_type, btn->linux_code, val);
 		}
 	}
 	input_sync(input);
@@ -457,7 +479,6 @@ static int armiga_setup_axis(struct device *dev, struct armiga_axis *axis,
 static int armiga_parse_buttons(struct armiga_joypad *joypad)
 {
 	struct device *dev = joypad->dev;
-	struct fwnode_handle *child;
 	int idx = 0;
 
 	joypad->num_buttons = device_get_child_node_count(dev);
@@ -485,6 +506,16 @@ static int armiga_parse_buttons(struct armiga_joypad *joypad)
 
 		if (fwnode_property_read_u32(child, "linux,input-type", &btn->report_type))
 			btn->report_type = EV_KEY;
+
+		/* D-pad como hat: sin IRQ, se sondea y se reporta como ABS_HAT0X/Y */
+		fwnode_property_read_u32(child, "rocknix,dpad-hat", &btn->dpad_hat);
+		fwnode_property_read_u32(child, "armiga,dpad-hat", &btn->dpad_hat);
+		if (btn->dpad_hat) {
+			btn->use_irq = false;
+			joypad->any_button_polling = true;
+			joypad->has_hat = true;
+			continue;
+		}
 
 		/* Intentar usar interrupción nativa */
 		irq = gpiod_to_irq(btn->desc);
@@ -560,6 +591,13 @@ static int armiga_setup_input_device(struct armiga_joypad *joypad)
 			struct armiga_button *btn = &joypad->buttons[i];
 			input_set_capability(input, btn->report_type, btn->linux_code);
 		}
+	}
+
+	/* D-pad como hat (ABS_HAT0X/Y), igual que el driver original */
+	if (joypad->has_hat) {
+		__set_bit(EV_ABS, input->evbit);
+		input_set_abs_params(input, ABS_HAT0X, -1, 1, 0, 0);
+		input_set_abs_params(input, ABS_HAT0Y, -1, 1, 0, 0);
 	}
 
 	/* BTN_MODE lo inyecta adc-keys a traves de joypad_input_g */
