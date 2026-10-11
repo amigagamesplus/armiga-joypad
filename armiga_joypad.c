@@ -432,12 +432,16 @@ static void armiga_joypad_close(struct input_dev *input)
 {
 	struct armiga_joypad *joypad = input_get_drvdata(input);
 
-	guard(mutex)(&joypad->lock);
-	joypad->enabled = false;
+	scoped_guard(mutex, &joypad->lock) {
+		joypad->enabled = false;
+	}
 
 	if (joypad->has_rumble) {
+		/* Fuera del mutex: el trabajo tambien lo toma */
 		cancel_work_sync(&joypad->rumble_work);
-		armiga_pwm_rumble_stop(joypad);
+		scoped_guard(mutex, &joypad->lock) {
+			armiga_pwm_rumble_stop(joypad);
+		}
 	}
 	dev_info(joypad->dev, "Joypad cerrado\n");
 }
@@ -493,7 +497,6 @@ static int armiga_parse_buttons(struct armiga_joypad *joypad)
 	/* Iterador seguro RAII para hijos en Device Tree / FWNODE */
 	device_for_each_child_node_scoped(dev, child) {
 		struct armiga_button *btn = &joypad->buttons[idx++];
-		int irq, err;
 
 		fwnode_property_read_string(child, "label", &btn->label);
 		btn->desc = devm_fwnode_gpiod_get(dev, child, NULL, GPIOD_IN, btn->label);
@@ -517,7 +520,25 @@ static int armiga_parse_buttons(struct armiga_joypad *joypad)
 			continue;
 		}
 
-		/* Intentar usar interrupción nativa */
+		btn->use_irq = false; /* las IRQ se piden tras registrar el input */
+	}
+
+	return 0;
+}
+
+/* Pide las IRQ de los botones una vez registrado el input, que es lo que usa el handler */
+static void armiga_request_button_irqs(struct armiga_joypad *joypad)
+{
+	struct device *dev = joypad->dev;
+	int i;
+
+	for (i = 0; i < joypad->num_buttons; i++) {
+		struct armiga_button *btn = &joypad->buttons[i];
+		int irq, err;
+
+		if (btn->dpad_hat)
+			continue;
+
 		irq = gpiod_to_irq(btn->desc);
 		if (irq > 0) {
 			err = devm_request_threaded_irq(dev, irq, NULL,
@@ -532,11 +553,8 @@ static int armiga_parse_buttons(struct armiga_joypad *joypad)
 		}
 
 		/* Fallback a polling si el pin no soporta IRQ */
-		btn->use_irq = false;
 		joypad->any_button_polling = true;
 	}
-
-	return 0;
 }
 
 static int armiga_setup_input_device(struct armiga_joypad *joypad)
@@ -641,16 +659,24 @@ static ssize_t rumble_enable_store(struct device *dev, struct device_attribute *
 	struct armiga_joypad *joypad = dev_get_drvdata(dev);
 	bool enable;
 	int ret = kstrtobool(buf, &enable);
+	bool changed = false;
 
 	if (ret)
 		return ret;
 
-	guard(mutex)(&joypad->lock);
-	if (joypad->rumble_enabled != enable) {
-		joypad->rumble_enabled = enable;
-		if (!enable) {
-			joypad->rumble_level = 0;
-			cancel_work_sync(&joypad->rumble_work);
+	scoped_guard(mutex, &joypad->lock) {
+		if (joypad->rumble_enabled != enable) {
+			joypad->rumble_enabled = enable;
+			changed = true;
+			if (!enable)
+				joypad->rumble_level = 0;
+		}
+	}
+
+	if (changed && !enable) {
+		/* Fuera del mutex: el trabajo tambien lo toma */
+		cancel_work_sync(&joypad->rumble_work);
+		scoped_guard(mutex, &joypad->lock) {
 			armiga_pwm_rumble_stop(joypad);
 		}
 	}
@@ -784,10 +810,13 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 	/* Soporte de Rumble (PWM) */
 	if (device_property_present(dev, "pwm-names") || device_property_present(dev, "pwms")) {
 		joypad->pwm = devm_pwm_get(dev, "enable");
+		if (PTR_ERR_OR_ZERO(joypad->pwm) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
 		if (!IS_ERR(joypad->pwm)) {
 			joypad->has_rumble = true;
 			joypad->rumble_enabled = true;
 			INIT_WORK(&joypad->rumble_work, armiga_rumble_work_fn);
+			armiga_pwm_rumble_stop(joypad); /* arrancar con el motor apagado */
 			device_property_read_u32(dev, "rumble-boost-weak", &joypad->boost_weak);
 			device_property_read_u32(dev, "rumble-boost-strong", &joypad->boost_strong);
 		}
@@ -797,6 +826,8 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 	err = armiga_setup_input_device(joypad);
 	if (err)
 		return err;
+
+	armiga_request_button_irqs(joypad);
 
 	dev_info(dev, "Armiga Joypad inicializado correctamente (%d ejes, %d botones)\n",
 		 joypad->num_axes, joypad->num_buttons);
@@ -825,7 +856,7 @@ static struct platform_driver armiga_joypad_driver = {
 
 module_platform_driver(armiga_joypad_driver);
 
-MODULE_AUTHOR("Armiga Project <https://github.com/armiga>");
+MODULE_AUTHOR("Armiga Project <https://github.com/amigagamesplus/armiga>");
 MODULE_DESCRIPTION("Driver unificado de gamepad para plataformas Armiga");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:" ARMIGA_DRV_NAME);
