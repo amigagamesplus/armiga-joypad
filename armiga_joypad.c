@@ -353,6 +353,25 @@ static void armiga_pwm_rumble_stop(struct armiga_joypad *joypad)
 	pwm_disable(joypad->pwm);
 }
 
+/*
+ * Periodo y polaridad salen de "pwms" en el DT (p. ej. 1 ms). Sin esto el estado
+ * interno conserva el valor de reset del hardware (42 ns) y el ciclo de trabajo
+ * se redondea a 0 % o 100 %: el motor no responde a los niveles intermedios.
+ */
+static int armiga_pwm_rumble_init(struct armiga_joypad *joypad)
+{
+	struct pwm_state state;
+
+	pwm_init_state(joypad->pwm, &state);
+	state.enabled = false;
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0))
+	return pwm_apply_might_sleep(joypad->pwm, &state);
+#else
+	return pwm_apply_state(joypad->pwm, &state);
+#endif
+}
+
 static void armiga_rumble_work_fn(struct work_struct *work)
 {
 	struct armiga_joypad *joypad = container_of(work, struct armiga_joypad, rumble_work);
@@ -816,7 +835,8 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 			joypad->has_rumble = true;
 			joypad->rumble_enabled = true;
 			INIT_WORK(&joypad->rumble_work, armiga_rumble_work_fn);
-			armiga_pwm_rumble_stop(joypad); /* arrancar con el motor apagado */
+			if (armiga_pwm_rumble_init(joypad))
+				dev_warn(dev, "No se pudo inicializar el PWM de rumble\n");
 			device_property_read_u32(dev, "rumble-boost-weak", &joypad->boost_weak);
 			device_property_read_u32(dev, "rumble-boost-strong", &joypad->boost_strong);
 		}
