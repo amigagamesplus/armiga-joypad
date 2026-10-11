@@ -15,7 +15,7 @@
 /* Configuración predeterminada de ADC */
 #define ARMIGA_ADC_MAX_VOLTAGE		1800
 #define ARMIGA_ADC_TUNING_DEFAULT	180
-#define ARMIGA_EMA_ALPHA_DEFAULT	180  /* ~70% peso a nueva muestra (base 256) */
+#define ARMIGA_EMA_ALPHA_DEFAULT	256  /* sin filtro: respuesta identica al driver original (base 256) */
 
 /* Canales máximos admitidos para multiplexor o IIO directo */
 #define ARMIGA_MAX_AXES			6
