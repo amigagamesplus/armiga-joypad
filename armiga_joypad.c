@@ -33,6 +33,17 @@
 
 #include "armiga_joypad.h"
 
+/*
+ * Definido y exportado por el parche 0004 del kernel (adc-keys): el boton MODE
+ * (keycode 316) llega por el ADC de teclas y se reporta en este input.
+ */
+extern struct input_dev *joypad_input_g;
+
+static void armiga_clear_input_g(void *data)
+{
+	joypad_input_g = NULL;
+}
+
 #define ARMIGA_TUNING_FACTOR(x, p)	(((x) * (p)) / 100)
 #define ARMIGA_CLAMP(x, low, high)	clamp_t(int, (x), (low), (high))
 
@@ -515,6 +526,20 @@ static int armiga_setup_input_device(struct armiga_joypad *joypad)
 	input->name = name;
 	input->phys = ARMIGA_DRV_NAME "/input0";
 
+	/* Identidad del dispositivo (la usan los autoconfig de RetroArch y SDL) */
+	{
+		u32 bustype = BUS_HOST, vendor = 0, product = 0, revision = 0;
+
+		device_property_read_u32(dev, "joypad-bustype", &bustype);
+		device_property_read_u32(dev, "joypad-vendor", &vendor);
+		device_property_read_u32(dev, "joypad-product", &product);
+		device_property_read_u32(dev, "joypad-revision", &revision);
+		input->id.bustype = (u16)bustype;
+		input->id.vendor = (u16)vendor;
+		input->id.product = (u16)product;
+		input->id.version = (u16)revision;
+	}
+
 	input->open = armiga_joypad_open;
 	input->close = armiga_joypad_close;
 
@@ -537,6 +562,9 @@ static int armiga_setup_input_device(struct armiga_joypad *joypad)
 		}
 	}
 
+	/* BTN_MODE lo inyecta adc-keys a traves de joypad_input_g */
+	input_set_capability(input, EV_KEY, BTN_MODE);
+
 	/* Configuración de Rumble */
 	if (joypad->has_rumble) {
 		input_set_capability(input, EV_FF, FF_RUMBLE);
@@ -552,7 +580,12 @@ static int armiga_setup_input_device(struct armiga_joypad *joypad)
 
 	input_set_poll_interval(input, joypad->poll_interval_ms);
 
-	return input_register_device(input);
+	err = input_register_device(input);
+	if (err)
+		return err;
+
+	joypad_input_g = input;
+	return devm_add_action_or_reset(dev, armiga_clear_input_g, NULL);
 }
 
 /*----------------------------------------------------------------------------*/
