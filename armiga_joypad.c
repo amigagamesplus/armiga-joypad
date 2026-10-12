@@ -257,7 +257,11 @@ static irqreturn_t armiga_button_irq_handler(int irq, void *dev_id)
 		struct armiga_button *btn = &joypad->buttons[i];
 
 		if (btn->irq == irq) {
-			int val = gpiod_get_value_cansleep(btn->desc);
+			int val;
+
+			/* Antirrebote: la IRQ sigue enmascarada (ONESHOT); se lee el nivel estable */
+			msleep(10);
+			val = gpiod_get_value_cansleep(btn->desc);
 			if (val >= 0 && val != btn->old_value) {
 				input_event(joypad->input, btn->report_type, btn->linux_code, val);
 				input_sync(joypad->input);
