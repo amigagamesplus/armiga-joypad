@@ -869,11 +869,40 @@ static const struct of_device_id armiga_joypad_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, armiga_joypad_of_match);
 
+/* Igual que el original: el rumble no debe quedar activo durante el suspend */
+static int armiga_joypad_suspend(struct device *dev)
+{
+	struct armiga_joypad *joypad = dev_get_drvdata(dev);
+
+	if (!joypad->has_rumble)
+		return 0;
+
+	/* Fuera del mutex: el trabajo tambien lo toma */
+	cancel_work_sync(&joypad->rumble_work);
+	scoped_guard(mutex, &joypad->lock) {
+		armiga_pwm_rumble_stop(joypad);
+	}
+	return 0;
+}
+
+static int armiga_joypad_resume(struct device *dev)
+{
+	struct armiga_joypad *joypad = dev_get_drvdata(dev);
+
+	/* Con nivel 0 el trabajo deja el PWM apagado */
+	if (joypad->has_rumble)
+		schedule_work(&joypad->rumble_work);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(armiga_joypad_pm_ops, armiga_joypad_suspend, armiga_joypad_resume);
+
 static struct platform_driver armiga_joypad_driver = {
 	.probe = armiga_joypad_probe,
 	.driver = {
 		.name = ARMIGA_DRV_NAME,
 		.dev_groups = armiga_joypad_groups,
+		.pm = pm_sleep_ptr(&armiga_joypad_pm_ops),
 		.of_match_table = armiga_joypad_of_match,
 	},
 };
