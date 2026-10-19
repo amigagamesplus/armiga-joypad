@@ -33,7 +33,7 @@
 				button-adc-fuzz = <16>;
 				button-adc-flat = <16>;
 				poll-interval = <16>; /* 16ms (~60Hz) */
-				armiga,filter-alpha = <180>; /* Filtro EMA anti-ruido (base 256) */
+				armiga,filter-alpha = <180>; /* Optional EMA filter (base 256); omit it to keep the filter disabled, the default */
 
 				/* Inversión y ajuste fino por eje */
 				invert-absy;
