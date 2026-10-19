@@ -111,7 +111,6 @@ joypad: armiga-singleadc-joypad {
 
 - `armiga_joypad.h`: constants, structures and macros.
 - `armiga_joypad.c`: driver source.
-- `armiga-joypad.dts`: example node only; the pins in it are placeholders, not the device tree of any real board.
 - `Makefile`: out-of-tree Kbuild script (`all`, `clean`, `install`).
 - `.gitattributes`: forces LF line endings.
 
