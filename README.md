@@ -66,7 +66,7 @@ The module file is `armiga-joypad.ko` (module name `armiga_joypad`). There is no
 | `abs_*-p-tuning`, `abs_*-n-tuning` | Per-axis, per-direction tuning |
 | `invert-absx`, `invert-absy`, `invert-absrx`, `invert-absry` | Invert an axis |
 | `poll-interval` | Polling interval in milliseconds |
-| `armiga,filter-alpha` | EMA alpha, 0..256 (256 = filter disabled, the default) |
+| `armiga,filter-alpha` | EMA alpha, 1..256 (256 = filter disabled, the default; out-of-range values are clamped) |
 | `pwms`, `pwm-names` | Rumble PWM (period and polarity are taken from here) |
 | `rumble-boost-weak`, `rumble-boost-strong` | Level offset added to weak / strong effects |
 

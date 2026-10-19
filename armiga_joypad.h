@@ -18,7 +18,7 @@
 #define ARMIGA_EMA_ALPHA_DEFAULT	256  /* sin filtro: respuesta identica al driver original (base 256) */
 
 /* Canales máximos admitidos para multiplexor o IIO directo */
-#define ARMIGA_MAX_AXES			6
+#define ARMIGA_MAX_AXES			4
 #define ARMIGA_AMUX_CH_NUM		4
 
 #endif /* _ARMIGA_JOYPAD_H_ */

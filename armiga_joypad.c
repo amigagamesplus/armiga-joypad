@@ -41,7 +41,7 @@ extern struct input_dev *joypad_input_g;
 
 static void armiga_clear_input_g(void *data)
 {
-	joypad_input_g = NULL;
+	WRITE_ONCE(joypad_input_g, NULL);
 }
 
 #define ARMIGA_TUNING_FACTOR(x, p)	(((x) * (p)) / 100)
@@ -162,7 +162,8 @@ static int armiga_amux_select(struct armiga_joypad *joypad, int channel)
 	return 0;
 }
 
-static int armiga_read_raw_axis(struct armiga_joypad *joypad, struct armiga_axis *axis)
+/* Devuelve 0 y el valor en *value, o un errno negativo si falla la lectura */
+static int armiga_read_raw_axis(struct armiga_joypad *joypad, struct armiga_axis *axis, int *value)
 {
 	int raw_value = 0;
 	int ret;
@@ -170,7 +171,7 @@ static int armiga_read_raw_axis(struct armiga_joypad *joypad, struct armiga_axis
 	if (joypad->use_amux) {
 		ret = armiga_amux_select(joypad, axis->channel);
 		if (ret < 0)
-			return 0;
+			return ret;
 
 		ret = iio_read_channel_raw(joypad->amux.iio_ch, &raw_value);
 	} else {
@@ -178,12 +179,13 @@ static int armiga_read_raw_axis(struct armiga_joypad *joypad, struct armiga_axis
 	}
 
 	if (ret < 0)
-		return 0;
+		return ret;
 
 	if (axis->scale > 0)
 		raw_value *= axis->scale;
 
-	return raw_value;
+	*value = raw_value;
+	return 0;
 }
 
 /*----------------------------------------------------------------------------*/
@@ -200,14 +202,12 @@ static void armiga_joypad_process_sticks(struct armiga_joypad *joypad)
 		int x, y;
 		int mag;
 
-		raw_x = armiga_read_raw_axis(joypad, ax);
-		if (!raw_x)
+		if (armiga_read_raw_axis(joypad, ax, &raw_x) < 0)
 			continue;
 		x = armiga_filter_ema(joypad, ax, raw_x) - ax->cal;
 
 		if (ay) {
-			raw_y = armiga_read_raw_axis(joypad, ay);
-			if (!raw_y)
+			if (armiga_read_raw_axis(joypad, ay, &raw_y) < 0)
 				continue;
 			y = armiga_filter_ema(joypad, ay, raw_y) - ay->cal;
 
@@ -425,8 +425,9 @@ static int armiga_joypad_open(struct input_dev *input)
 	/* Calibrar centro de ejes al abrir */
 	for (i = 0; i < joypad->num_axes; i++) {
 		struct armiga_axis *ax = &joypad->axes[i];
-		int raw = armiga_read_raw_axis(joypad, ax);
-		if (raw > 0) {
+		int raw;
+
+		if (!armiga_read_raw_axis(joypad, ax, &raw) && raw > 0) {
 			ax->cal = raw;
 			ax->last_filtered = raw;
 			dev_info(joypad->dev, "Eje '%s' centrado en %d mV\n", ax->name, ax->cal);
@@ -440,13 +441,14 @@ static int armiga_joypad_open(struct input_dev *input)
 		if (val >= 0) {
 			btn->old_value = val;
 			if (!btn->dpad_hat)
-					input_event(input, btn->report_type, btn->linux_code, val);
+				input_event(input, btn->report_type, btn->linux_code, val);
 		}
 	}
 	input_sync(input);
 
-	guard(mutex)(&joypad->lock);
-	joypad->enabled = true;
+	scoped_guard(mutex, &joypad->lock) {
+		joypad->enabled = true;
+	}
 	dev_info(joypad->dev, "Joypad abierto y habilitado\n");
 	return 0;
 }
@@ -663,7 +665,7 @@ static int armiga_setup_input_device(struct armiga_joypad *joypad)
 	if (err)
 		return err;
 
-	joypad_input_g = input;
+	WRITE_ONCE(joypad_input_g, input);
 	return devm_add_action_or_reset(dev, armiga_clear_input_g, NULL);
 }
 
@@ -744,6 +746,7 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 
 	joypad->ema_alpha = ARMIGA_EMA_ALPHA_DEFAULT;
 	device_property_read_u32(dev, "armiga,filter-alpha", &joypad->ema_alpha);
+	joypad->ema_alpha = clamp(joypad->ema_alpha, 1, 256);
 
 	/* Determinar arquitectura analógica: AMUX vs Canales IIO directos */
 	device_property_read_u32(dev, "amux-count", &amux_count);
@@ -798,6 +801,9 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 			int i;
 
 			joypad->num_axes = min(ch_count, ARMIGA_MAX_AXES);
+			/* Los ejes van por pares (X/Y, RX/RY) */
+			if (joypad->num_axes == 3)
+				joypad->num_axes = 2;
 			joypad->iio_channels = devm_kcalloc(dev, joypad->num_axes,
 							    sizeof(struct iio_channel *), GFP_KERNEL);
 			joypad->axes = devm_kcalloc(dev, joypad->num_axes,
@@ -817,7 +823,8 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 
 			/* Mapeo predeterminado de ejes */
 			armiga_setup_axis(dev, &joypad->axes[0], "x",  ABS_X,  0, scale);
-			armiga_setup_axis(dev, &joypad->axes[1], "y",  ABS_Y,  1, scale);
+			if (joypad->num_axes >= 2)
+				armiga_setup_axis(dev, &joypad->axes[1], "y",  ABS_Y,  1, scale);
 			if (joypad->num_axes >= 4) {
 				armiga_setup_axis(dev, &joypad->axes[2], "rx", ABS_RX, 2, scale);
 				armiga_setup_axis(dev, &joypad->axes[3], "ry", ABS_RY, 3, scale);
@@ -843,6 +850,8 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 				dev_warn(dev, "No se pudo inicializar el PWM de rumble\n");
 			device_property_read_u32(dev, "rumble-boost-weak", &joypad->boost_weak);
 			device_property_read_u32(dev, "rumble-boost-strong", &joypad->boost_strong);
+			joypad->boost_weak = min_t(u32, joypad->boost_weak, 0xffff);
+			joypad->boost_strong = min_t(u32, joypad->boost_strong, 0xffff);
 		}
 	}
 
