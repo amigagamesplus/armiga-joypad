@@ -5,15 +5,14 @@
  * Driver moderno y de alto rendimiento para gamepads integrados en
  * plataformas Armiga y dispositivos de juego embebidos.
  *
- * Características:
- *  - Soporte para SARADC multicanal directo o multiplexado analógico (AMUX).
- *  - Filtrado digital anti-ruido (EMA - Media Móvil Exponencial) en aritmética entera.
- *  - Zona muerta radial escalada con cálculo por vector de magnitud sin pérdida diagonal.
- *  - Botones digitales gestionados por interrupciones (IRQs) con fallback a polling.
- *  - Soporte Force Feedback (Rumble) por PWM con API moderna sin bloqueos.
- *  - Limpieza automática RAII (guard / scoped) compatible con kernels modernos (6.6+, 6.12 LTS, 7.x).
+ * Historial de versiones:
+ *  v1.0.0 (2026-10) - Versión inicial unificada para plataformas Armiga.
+ *  v1.1.0 (2026-11) - Corrección de concurrencia en rumble (spinlock en contexto atómico),
+ *                     filtro de eventos redundantes en D-pad (ahorro de batería y CPU),
+ *                     protección contra división por cero y desbordamiento entero en 64 bits,
+ *                     limpieza de tareas pendientes en descarga y soporte de versión del módulo.
  *
- * Copyright (C) 2026 Armiga Project <https://github.com/armiga>
+ * Copyright (C) 2026 Armiga Project <https://github.com/amigagamesplus/armiga>
  */
 
 #include <linux/module.h>
@@ -29,6 +28,7 @@
 #include <linux/cleanup.h>
 #include <linux/mutex.h>
 #include <linux/delay.h>
+#include <linux/math64.h>
 #include <linux/version.h>
 
 #include "armiga_joypad.h"
@@ -100,6 +100,8 @@ struct armiga_joypad {
 	struct armiga_button *buttons;
 	bool any_button_polling;
 	bool has_hat;
+	int old_hat_x;
+	int old_hat_y;
 
 	/* Parámetros de filtrado y zona muerta */
 	int poll_interval_ms;
@@ -111,6 +113,7 @@ struct armiga_joypad {
 	/* Rumble (PWM Force Feedback) */
 	bool has_rumble;
 	bool rumble_enabled;
+	spinlock_t rumble_lock;
 	struct pwm_device *pwm;
 	struct work_struct rumble_work;
 	u16 rumble_level;
@@ -143,21 +146,18 @@ static int armiga_amux_select(struct armiga_joypad *joypad, int channel)
 {
 	struct armiga_amux *amux = &joypad->amux;
 
+	if (channel < 0 || channel >= ARMIGA_AMUX_CH_NUM)
+		return -EINVAL;
+
 	/* Misma polaridad que el driver original: EN=0 habilita el mux */
 	if (amux->en)
 		gpiod_set_value_cansleep(amux->en, 0);
-
-	if (channel < 0 || channel >= ARMIGA_AMUX_CH_NUM) {
-		if (amux->en)
-			gpiod_set_value_cansleep(amux->en, 1);
-		return -EINVAL;
-	}
 
 	/* canal 0: A=0 B=0, 1: A=0 B=1, 2: A=1 B=0, 3: A=1 B=1 */
 	gpiod_set_value_cansleep(amux->sel_a, (channel >> 1) & 1);
 	gpiod_set_value_cansleep(amux->sel_b, channel & 1);
 
-	/* Conmutacion del mux: 35 ns (on) / 9 ns (off) */
+	/* Conmutacion del mux: mismo asentamiento que el driver verificado en hardware */
 	usleep_range(10, 20);
 	return 0;
 }
@@ -198,50 +198,61 @@ static void armiga_joypad_process_sticks(struct armiga_joypad *joypad)
 	for (i = 0; i < joypad->num_axes; i += 2) {
 		struct armiga_axis *ax = &joypad->axes[i];
 		struct armiga_axis *ay = (i + 1 < joypad->num_axes) ? &joypad->axes[i + 1] : NULL;
-		int raw_x, raw_y;
-		int x, y;
+		int raw_x = 0, raw_y = 0;
+		int x = 0, y = 0;
 		int mag;
+		bool read_x_ok = (armiga_read_raw_axis(joypad, ax, &raw_x) == 0);
+		bool read_y_ok = false;
 
-		if (armiga_read_raw_axis(joypad, ax, &raw_x) < 0)
-			continue;
-		x = armiga_filter_ema(joypad, ax, raw_x) - ax->cal;
+		if (read_x_ok)
+			x = armiga_filter_ema(joypad, ax, raw_x) - ax->cal;
 
 		if (ay) {
-			if (armiga_read_raw_axis(joypad, ay, &raw_y) < 0)
-				continue;
-			y = armiga_filter_ema(joypad, ay, raw_y) - ay->cal;
+			read_y_ok = (armiga_read_raw_axis(joypad, ay, &raw_y) == 0);
+			if (read_y_ok)
+				y = armiga_filter_ema(joypad, ay, raw_y) - ay->cal;
 
-			/* Deadzone Radial Escalado */
-			mag = int_sqrt((long)x * x + (long)y * y);
-			if (joypad->deadzone > 0) {
-				if (mag <= joypad->deadzone) {
-					x = 0;
-					y = 0;
-				} else if (mag > 0 && ax->max > joypad->deadzone) {
-					x = (((ax->max * x) / mag) * (mag - joypad->deadzone)) /
-					    (ax->max - joypad->deadzone);
-					y = (((ay->max * y) / mag) * (mag - joypad->deadzone)) /
-					    (ay->max - joypad->deadzone);
+			/* Si falla una lectura del par se salta entero (como antes) */
+			if (!read_x_ok || !read_y_ok)
+				continue;
+
+			if (read_x_ok && read_y_ok) {
+				/* Deadzone Radial Escalado con proteccion de desbordamiento en 64 bits */
+				mag = int_sqrt((u64)x * x + (u64)y * y);
+				if (joypad->deadzone > 0) {
+					if (mag <= joypad->deadzone) {
+						x = 0;
+						y = 0;
+					} else if (mag > 0 && ax->max > joypad->deadzone && ay->max > joypad->deadzone) {
+						x = div_s64(div_s64((s64)ax->max * x, mag) * (mag - joypad->deadzone),
+							    ax->max - joypad->deadzone);
+						y = div_s64(div_s64((s64)ay->max * y, mag) * (mag - joypad->deadzone),
+							    ay->max - joypad->deadzone);
+					}
 				}
 			}
 
-			/* Curvas no lineales cuadrante positivo / negativo */
-			if (ay->tuning_n && y < 0)
-				y = ARMIGA_TUNING_FACTOR(y, ay->tuning_n);
-			if (ay->tuning_p && y > 0)
-				y = ARMIGA_TUNING_FACTOR(y, ay->tuning_p);
+			if (read_y_ok) {
+				/* Curvas no lineales cuadrante positivo / negativo */
+				if (ay->tuning_n && y < 0)
+					y = ARMIGA_TUNING_FACTOR(y, ay->tuning_n);
+				if (ay->tuning_p && y > 0)
+					y = ARMIGA_TUNING_FACTOR(y, ay->tuning_p);
 
-			y = ARMIGA_CLAMP(y, ay->min, ay->max);
-			input_report_abs(joypad->input, ay->code, ay->invert ? -y : y);
+				y = ARMIGA_CLAMP(y, ay->min, ay->max);
+				input_report_abs(joypad->input, ay->code, ay->invert ? -y : y);
+			}
 		}
 
-		if (ax->tuning_n && x < 0)
-			x = ARMIGA_TUNING_FACTOR(x, ax->tuning_n);
-		if (ax->tuning_p && x > 0)
-			x = ARMIGA_TUNING_FACTOR(x, ax->tuning_p);
+		if (read_x_ok) {
+			if (ax->tuning_n && x < 0)
+				x = ARMIGA_TUNING_FACTOR(x, ax->tuning_n);
+			if (ax->tuning_p && x > 0)
+				x = ARMIGA_TUNING_FACTOR(x, ax->tuning_p);
 
-		x = ARMIGA_CLAMP(x, ax->min, ax->max);
-		input_report_abs(joypad->input, ax->code, ax->invert ? -x : x);
+			x = ARMIGA_CLAMP(x, ax->min, ax->max);
+			input_report_abs(joypad->input, ax->code, ax->invert ? -x : x);
+		}
 	}
 }
 
@@ -305,9 +316,13 @@ static void armiga_joypad_check_buttons_poll(struct armiga_joypad *joypad)
 			case 4: hat_x = 1; break;
 			}
 		}
-		input_report_abs(joypad->input, ABS_HAT0X, hat_x);
-		input_report_abs(joypad->input, ABS_HAT0Y, hat_y);
-		sync_needed = true;
+		if (hat_x != joypad->old_hat_x || hat_y != joypad->old_hat_y) {
+			input_report_abs(joypad->input, ABS_HAT0X, hat_x);
+			input_report_abs(joypad->input, ABS_HAT0Y, hat_y);
+			joypad->old_hat_x = hat_x;
+			joypad->old_hat_y = hat_y;
+			sync_needed = true;
+		}
 	}
 
 	if (sync_needed)
@@ -354,7 +369,20 @@ static int armiga_pwm_rumble_start(struct armiga_joypad *joypad)
 
 static void armiga_pwm_rumble_stop(struct armiga_joypad *joypad)
 {
-	pwm_disable(joypad->pwm);
+	struct pwm_state state;
+
+	if (!joypad->pwm)
+		return;
+
+	pwm_get_state(joypad->pwm, &state);
+	state.enabled = false;
+	state.duty_cycle = 0;
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0))
+	pwm_apply_might_sleep(joypad->pwm, &state);
+#else
+	pwm_apply_state(joypad->pwm, &state);
+#endif
 }
 
 /*
@@ -379,10 +407,16 @@ static int armiga_pwm_rumble_init(struct armiga_joypad *joypad)
 static void armiga_rumble_work_fn(struct work_struct *work)
 {
 	struct armiga_joypad *joypad = container_of(work, struct armiga_joypad, rumble_work);
+	unsigned long flags;
+	u16 level;
+	bool enabled;
 
-	guard(mutex)(&joypad->lock);
+	spin_lock_irqsave(&joypad->rumble_lock, flags);
+	level = joypad->rumble_level;
+	enabled = joypad->rumble_enabled && READ_ONCE(joypad->enabled);
+	spin_unlock_irqrestore(&joypad->rumble_lock, flags);
 
-	if (!joypad->rumble_enabled || joypad->rumble_level == 0) {
+	if (!enabled || level == 0) {
 		armiga_pwm_rumble_stop(joypad);
 		return;
 	}
@@ -393,22 +427,30 @@ static void armiga_rumble_work_fn(struct work_struct *work)
 static int armiga_rumble_play_effect(struct input_dev *dev, void *data, struct ff_effect *effect)
 {
 	struct armiga_joypad *joypad = data;
+	unsigned long flags;
 	u32 level;
 
 	if (effect->type != FF_RUMBLE)
 		return 0;
 
-	scoped_guard(mutex, &joypad->lock) {
-		if (!joypad->rumble_enabled)
-			return 0;
-
-		if (effect->u.rumble.strong_magnitude)
-			level = effect->u.rumble.strong_magnitude + joypad->boost_strong;
-		else
-			level = effect->u.rumble.weak_magnitude + joypad->boost_weak;
-
-		joypad->rumble_level = (u16)ARMIGA_CLAMP(level, 0, 0xffff);
+	/* Contexto atomico (timer/spinlock de input_ff): se usa spinlock, nunca mutex */
+	spin_lock_irqsave(&joypad->rumble_lock, flags);
+	if (!joypad->rumble_enabled || !READ_ONCE(joypad->enabled)) {
+		joypad->rumble_level = 0;
+		spin_unlock_irqrestore(&joypad->rumble_lock, flags);
+		schedule_work(&joypad->rumble_work);
+		return 0;
 	}
+
+	if (effect->u.rumble.strong_magnitude)
+		level = effect->u.rumble.strong_magnitude + joypad->boost_strong;
+	else if (effect->u.rumble.weak_magnitude)
+		level = effect->u.rumble.weak_magnitude + joypad->boost_weak;
+	else
+		level = 0;
+
+	joypad->rumble_level = (u16)ARMIGA_CLAMP(level, 0, 0xffff);
+	spin_unlock_irqrestore(&joypad->rumble_lock, flags);
 
 	schedule_work(&joypad->rumble_work);
 	return 0;
@@ -446,9 +488,7 @@ static int armiga_joypad_open(struct input_dev *input)
 	}
 	input_sync(input);
 
-	scoped_guard(mutex, &joypad->lock) {
-		joypad->enabled = true;
-	}
+	WRITE_ONCE(joypad->enabled, true);
 	dev_info(joypad->dev, "Joypad abierto y habilitado\n");
 	return 0;
 }
@@ -456,17 +496,16 @@ static int armiga_joypad_open(struct input_dev *input)
 static void armiga_joypad_close(struct input_dev *input)
 {
 	struct armiga_joypad *joypad = input_get_drvdata(input);
+	unsigned long flags;
 
-	scoped_guard(mutex, &joypad->lock) {
-		joypad->enabled = false;
-	}
+	WRITE_ONCE(joypad->enabled, false);
 
 	if (joypad->has_rumble) {
-		/* Fuera del mutex: el trabajo tambien lo toma */
 		cancel_work_sync(&joypad->rumble_work);
-		scoped_guard(mutex, &joypad->lock) {
-			armiga_pwm_rumble_stop(joypad);
-		}
+		spin_lock_irqsave(&joypad->rumble_lock, flags);
+		joypad->rumble_level = 0;
+		spin_unlock_irqrestore(&joypad->rumble_lock, flags);
+		armiga_pwm_rumble_stop(joypad);
 	}
 	dev_info(joypad->dev, "Joypad cerrado\n");
 }
@@ -669,13 +708,21 @@ static int armiga_setup_input_device(struct armiga_joypad *joypad)
 	return devm_add_action_or_reset(dev, armiga_clear_input_g, NULL);
 }
 
+static void armiga_cancel_rumble_work(void *data)
+{
+	struct armiga_joypad *joypad = data;
+
+	cancel_work_sync(&joypad->rumble_work);
+	armiga_pwm_rumble_stop(joypad);
+}
+
 /*----------------------------------------------------------------------------*/
 /* Atributos Sysfs Limpios                                                    */
 /*----------------------------------------------------------------------------*/
 static ssize_t rumble_enable_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct armiga_joypad *joypad = dev_get_drvdata(dev);
-	return sysfs_emit(buf, "%d\n", joypad->rumble_enabled ? 1 : 0);
+	return sysfs_emit(buf, "%d\n", READ_ONCE(joypad->rumble_enabled) ? 1 : 0);
 }
 
 static ssize_t rumble_enable_store(struct device *dev, struct device_attribute *attr,
@@ -685,32 +732,40 @@ static ssize_t rumble_enable_store(struct device *dev, struct device_attribute *
 	bool enable;
 	int ret = kstrtobool(buf, &enable);
 	bool changed = false;
+	unsigned long flags;
+
+	if (!joypad->has_rumble)
+		return -ENODEV;
 
 	if (ret)
 		return ret;
 
-	scoped_guard(mutex, &joypad->lock) {
-		if (joypad->rumble_enabled != enable) {
-			joypad->rumble_enabled = enable;
-			changed = true;
-			if (!enable)
-				joypad->rumble_level = 0;
-		}
+	spin_lock_irqsave(&joypad->rumble_lock, flags);
+	if (joypad->rumble_enabled != enable) {
+		joypad->rumble_enabled = enable;
+		changed = true;
+		if (!enable)
+			joypad->rumble_level = 0;
 	}
+	spin_unlock_irqrestore(&joypad->rumble_lock, flags);
 
 	if (changed && !enable) {
-		/* Fuera del mutex: el trabajo tambien lo toma */
 		cancel_work_sync(&joypad->rumble_work);
-		scoped_guard(mutex, &joypad->lock) {
-			armiga_pwm_rumble_stop(joypad);
-		}
+		armiga_pwm_rumble_stop(joypad);
 	}
 	return count;
 }
 static DEVICE_ATTR_RW(rumble_enable);
 
+static ssize_t version_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%s\n", ARMIGA_DRV_VERSION);
+}
+static DEVICE_ATTR_RO(version);
+
 static struct attribute *armiga_joypad_attrs[] = {
 	&dev_attr_rumble_enable.attr,
+	&dev_attr_version.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(armiga_joypad);
@@ -733,6 +788,7 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 
 	joypad->dev = dev;
 	mutex_init(&joypad->lock);
+	spin_lock_init(&joypad->rumble_lock);
 	platform_set_drvdata(pdev, joypad);
 
 	/* Lectura de propiedades generales de DT */
@@ -743,6 +799,7 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 
 	joypad->poll_interval_ms = 16; /* ~60 Hz por defecto */
 	device_property_read_u32(dev, "poll-interval", &joypad->poll_interval_ms);
+	joypad->poll_interval_ms = clamp(joypad->poll_interval_ms, 1, 1000);
 
 	joypad->ema_alpha = ARMIGA_EMA_ALPHA_DEFAULT;
 	device_property_read_u32(dev, "armiga,filter-alpha", &joypad->ema_alpha);
@@ -782,6 +839,11 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 			/* Canal del mux de cada eje (orden RY, RX, Y, X); por defecto 0 1 2 3 */
 			device_property_read_u32_array(dev, "amux-channel-mapping", amux_map,
 						       ARMIGA_AMUX_CH_NUM);
+			for (i = 0; i < ARMIGA_AMUX_CH_NUM; i++) {
+				if (amux_map[i] >= ARMIGA_AMUX_CH_NUM)
+					return dev_err_probe(dev, -EINVAL,
+							     "amux-channel-mapping[%d] fuera de rango\n", i);
+			}
 
 			joypad->num_axes = min_t(u32, amux_count, ARMIGA_AMUX_CH_NUM);
 			joypad->axes = devm_kcalloc(dev, joypad->num_axes,
@@ -842,10 +904,16 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 		joypad->pwm = devm_pwm_get(dev, "enable");
 		if (PTR_ERR_OR_ZERO(joypad->pwm) == -EPROBE_DEFER)
 			return -EPROBE_DEFER;
-		if (!IS_ERR(joypad->pwm)) {
+		if (IS_ERR(joypad->pwm)) {
+			dev_warn(dev, "PWM de rumble no disponible: %pe\n", joypad->pwm);
+			joypad->pwm = NULL;
+		} else {
 			joypad->has_rumble = true;
 			joypad->rumble_enabled = true;
 			INIT_WORK(&joypad->rumble_work, armiga_rumble_work_fn);
+			err = devm_add_action_or_reset(dev, armiga_cancel_rumble_work, joypad);
+			if (err)
+				return err;
 			if (armiga_pwm_rumble_init(joypad))
 				dev_warn(dev, "No se pudo inicializar el PWM de rumble\n");
 			device_property_read_u32(dev, "rumble-boost-weak", &joypad->boost_weak);
@@ -862,8 +930,8 @@ static int armiga_joypad_probe(struct platform_device *pdev)
 
 	armiga_request_button_irqs(joypad);
 
-	dev_info(dev, "Armiga Joypad inicializado correctamente (%d ejes, %d botones)\n",
-		 joypad->num_axes, joypad->num_buttons);
+	dev_info(dev, "Armiga Joypad v%s inicializado correctamente (%d ejes, %d botones)\n",
+		 ARMIGA_DRV_VERSION, joypad->num_axes, joypad->num_buttons);
 	return 0;
 }
 
@@ -882,15 +950,17 @@ MODULE_DEVICE_TABLE(of, armiga_joypad_of_match);
 static int armiga_joypad_suspend(struct device *dev)
 {
 	struct armiga_joypad *joypad = dev_get_drvdata(dev);
+	unsigned long flags;
 
 	if (!joypad->has_rumble)
 		return 0;
 
-	/* Fuera del mutex: el trabajo tambien lo toma */
 	cancel_work_sync(&joypad->rumble_work);
-	scoped_guard(mutex, &joypad->lock) {
-		armiga_pwm_rumble_stop(joypad);
-	}
+	spin_lock_irqsave(&joypad->rumble_lock, flags);
+	joypad->rumble_level = 0;
+	spin_unlock_irqrestore(&joypad->rumble_lock, flags);
+
+	armiga_pwm_rumble_stop(joypad);
 	return 0;
 }
 
@@ -898,7 +968,7 @@ static int armiga_joypad_resume(struct device *dev)
 {
 	struct armiga_joypad *joypad = dev_get_drvdata(dev);
 
-	/* Con nivel 0 el trabajo deja el PWM apagado */
+	/* Con nivel 0 (reiniciado en suspend) el trabajo deja el PWM apagado */
 	if (joypad->has_rumble)
 		schedule_work(&joypad->rumble_work);
 	return 0;
@@ -921,5 +991,6 @@ module_platform_driver(armiga_joypad_driver);
 MODULE_AUTHOR("Armiga Project <https://github.com/amigagamesplus/armiga>");
 MODULE_DESCRIPTION("Driver unificado de gamepad para plataformas Armiga");
 MODULE_LICENSE("GPL");
+MODULE_VERSION(ARMIGA_DRV_VERSION);
 MODULE_ALIAS("platform:" ARMIGA_DRV_NAME);
 MODULE_IMPORT_NS("IIO_CONSUMER");

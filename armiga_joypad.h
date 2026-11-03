@@ -11,6 +11,7 @@
 #include <linux/types.h>
 
 #define ARMIGA_DRV_NAME		"armiga-joypad"
+#define ARMIGA_DRV_VERSION	"1.1.0"
 
 /* Configuración predeterminada de ADC */
 #define ARMIGA_ADC_MAX_VOLTAGE		1800
