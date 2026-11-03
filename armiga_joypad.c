@@ -700,7 +700,7 @@ static int armiga_setup_input_device(struct armiga_joypad *joypad)
 
 	input_set_poll_interval(input, joypad->poll_interval_ms);
 
-	err = devm_input_register_device(input);
+	err = input_register_device(input);
 	if (err)
 		return err;
 
